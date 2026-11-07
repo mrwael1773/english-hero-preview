@@ -1,0 +1,56 @@
+name: Import isolated preview package
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out private preview repository
+        uses: actions/checkout@v4
+      - name: Download and validate isolated package
+        env:
+          PACKAGE_URL: https://sdmntprindiasocentral.oaiusercontent.com/files/00000000-b050-8211-bed1-e2228b0217b2/raw?se=2026-11-07T15%3A51%3A13Z&sp=r&sv=2026-02-06&sr=b&scid=02434c48-deb4-5348-97ca-254fd9d3d865&skoid=45d5558d-260a-4eed-aec4-6bc512bdfda4&sktid=a48cca56-e6da-484e-a814-9c849652bcb3&skt=2026-11-07T03%3A50%3A56Z&ske=2026-11-08T03%3A50%3A56Z&sks=b&skv=2026-02-06&sig=Chs%2Bd1cyYbgv0o/XLfk/R%2BXdwdNwC/eKOOroJAsO1N8%3D
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 2 "$PACKAGE_URL" --output /tmp/preview.zip
+          python3 - <<'PY'
+          import zipfile, re, sys
+          p='/tmp/preview.zip'
+          with zipfile.ZipFile(p) as z:
+              if z.testzip() is not None:
+                  raise SystemExit('ZIP integrity check failed')
+              names=z.namelist()
+              if len(names) != 25:
+                  raise SystemExit(f'Unexpected package file count: {len(names)}')
+              for n in names:
+                  if n.startswith('/') or '..' in n.split('/') or n.endswith('/'):
+                      raise SystemExit(f'Unsafe archive path: {n}')
+              cfg=z.read('config.js').decode('utf-8')
+              if 'knjcyuvhaoievxkzcdog.supabase.co' not in cfg:
+                  raise SystemExit('Test Supabase project ref missing')
+              if 'cajevfsdhtbhtzcphbsz' in cfg:
+                  raise SystemExit('Production Supabase ref found')
+              alltext='\n'.join(z.read(n).decode('utf-8', errors='ignore') for n in names if n.lower().endswith(('.html','.js','.json','.xml','.css','.txt','.webmanifest','.svg')))
+              forbidden=[r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----',r'gh[pousr]_[A-Za-z0-9]{20,}',r'(?i)service[_-]?role',r'cajevfsdhtbhtzcphbsz']
+              for pattern in forbidden:
+                  if re.search(pattern, alltext):
+                      raise SystemExit(f'Forbidden content detected: {pattern}')
+              if any('teacher-pilot' in n or 'school-pilot' in n for n in names):
+                  raise SystemExit('Teacher/school pilot page unexpectedly included')
+          print('Package integrity and isolation checks passed')
+          PY
+          mkdir -p /tmp/preview-payload
+          unzip -q /tmp/preview.zip -d /tmp/preview-payload
+          cp -a /tmp/preview-payload/. .
+      - name: Commit student preview files
+        run: |
+          set -euo pipefail
+          rm -f /tmp/preview.zip
+          rm -f .github/workflows/import-preview.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Import isolated English Hero student preview"
+          git push
