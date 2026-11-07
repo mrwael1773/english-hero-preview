@@ -1,0 +1,601 @@
+/* English Hero optional cloud sync. Requires config.js and Supabase Auth + learning_progress table. */
+(function(){
+  'use strict';
+  const $cloud = id => document.getElementById(id);
+  let resolveCloudReady;
+  window.EnglishHeroCloudReady = new Promise(resolve => { resolveCloudReady = resolve; });
+  let cloudReadyResolved = false;
+  const resolveCloudInitialization = value => {
+    if(cloudReadyResolved) return;
+    cloudReadyResolved = true;
+    resolveCloudReady(value);
+  };
+  let client = null;
+  let user = null;
+  // Track the owner of in-memory progress independently from the current auth session.
+  let progressOwnerUserId = null;
+  let clearingLocalAccountData = false;
+  let ready = false;
+  let timer = null;
+  let revision = 0;
+  let syncPromise = null;
+  let syncPromiseUserId = null;
+  // Serialize progress writes so an older snapshot can never finish after a newer one.
+  let uploadQueue = Promise.resolve(false);
+  const markPasswordRecovery = () => {
+    window.EnglishHeroPasswordRecovery = true;
+    try { sessionStorage.setItem('englishHeroPasswordRecovery','1'); } catch {}
+  };
+  const status = (message) => { const el=$cloud('cloudStatus'); if(el) el.textContent=message; };
+  async function cloudRequest(query, timeoutMs=15000){
+    const controller=new AbortController();
+    const timeout=setTimeout(()=>controller.abort(),timeoutMs);
+    try {
+      return await query.abortSignal(controller.signal);
+    } catch(error) {
+      if(controller.signal.aborted) throw new Error('انتهت مهلة المزامنة بعد 15 ثانية. سيبقى تقدمك محفوظًا على الجهاز؛ تحقق من الاتصال وحاول مجددًا.');
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  const validConfig = () => {
+    const c=window.ENGLISH_HERO_CLOUD_CONFIG;
+    return c && /^https:\/\/[^/]+\.supabase\.co$/.test(c.supabaseUrl||'')
+      && typeof c.supabaseAnonKey==='string'
+      && c.supabaseAnonKey.length>20
+      && !/YOUR_PROJECT|YOUR_SUPABASE|placeholder/i.test(c.supabaseUrl+c.supabaseAnonKey);
+  };
+  const setSignedInUI = () => {
+    const signedIn = !!user;
+    const authForm = $cloud('cloudAuthForm');
+    const googleButton = $cloud('cloudGoogle');
+    // Keep sign-in controls out of the way once a session is active.
+    if(authForm) authForm.classList.toggle('hidden', signedIn);
+    if(googleButton) {
+      googleButton.disabled = signedIn || !client;
+      const googleRow = googleButton.parentElement;
+      if(googleRow) googleRow.classList.toggle('hidden', signedIn);
+    }
+    if($cloud('cloudUser')) {
+      const metadata = user?.user_metadata || {};
+      const emailName = typeof user?.email === 'string' ? user.email.split('@')[0] : '';
+      const displayName = (typeof state !== 'undefined' && state.displayName) || metadata.full_name || metadata.name || metadata.user_name ||
+        metadata.preferred_username || emailName || 'المستخدم';
+      $cloud('cloudUser').textContent = signedIn ? '👋 أهلًا، ' + displayName + ' — تم تسجيل الدخول' : '';
+      $cloud('cloudUser').setAttribute('dir', 'auto');
+      $cloud('cloudUser').style.textAlign = 'start';
+    }
+    if($cloud('cloudSignIn')) $cloud('cloudSignIn').disabled = signedIn;
+    if($cloud('cloudSignUp')) $cloud('cloudSignUp').disabled = signedIn;
+    if($cloud('cloudEmail')) $cloud('cloudEmail').disabled = signedIn;
+    if($cloud('cloudPassword')) $cloud('cloudPassword').disabled = signedIn;
+    if($cloud('cloudSignOut')) $cloud('cloudSignOut').disabled = !signedIn;
+    if($cloud('cloudSyncNow')) $cloud('cloudSyncNow').disabled = !signedIn;
+    const clearLocalButton=$cloud('cloudClearLocalData');
+    if(clearLocalButton){clearLocalButton.classList.toggle('hidden',!signedIn);clearLocalButton.disabled=!signedIn||!ready||progressOwnerUserId!==user?.id;}
+    const restoreButton=$cloud('cloudRestoreBackup');
+    if(restoreButton){
+      let hasBackup=false;
+      try { hasBackup=!!(signedIn && localStorage.getItem('english-hero-account-backup-'+user.id)); } catch {}
+      restoreButton.classList.toggle('hidden',!hasBackup);
+      restoreButton.disabled=!signedIn || !ready || !hasBackup;
+    }
+  };
+  async function uploadProgress(){
+    if(!client||!user||!ready||progressOwnerUserId!==user.id) return false;
+    const syncUserId=user.id;
+    const current=revision;
+    let snapshot;
+    try {
+      snapshot=JSON.parse(JSON.stringify(state));
+    } catch(error) {
+      status('تعذر تجهيز نسخة التقدم للمزامنة. بقي تقدمك الحالي على الجهاز.');
+      console.error('English Hero cloud snapshot:',error?.message||error);
+      return false;
+    }
+    // Queue writes in invocation order. Each write owns an immutable snapshot.
+    const write=async()=>{
+      // Skip obsolete queued snapshots and writes belonging to a previous auth identity.
+      if(!user||user.id!==syncUserId||!ready||current!==revision)return false;
+      try {
+        const {error}=await cloudRequest(client.from('learning_progress').upsert({
+          user_id:syncUserId, progress:snapshot, updated_at:new Date().toISOString()
+        },{onConflict:'user_id'}));
+        if(error) throw error;
+        // Never associate this device's local copy with a different account.
+        if(user?.id===syncUserId){
+          progressOwnerUserId=syncUserId;
+          try { localStorage.setItem('english-hero-cloud-owner',syncUserId); } catch {}
+          if(current===revision) status('✅ تمت مزامنة تقدمك مع حسابك السحابي.');
+        }
+        return true;
+      } catch(error) {
+        status(String(error?.message||'').includes('انتهت مهلة المزامنة') ? error.message : 'تعذر رفع التقدم. سيبقى محفوظًا محليًا؛ تحقق من الاتصال وإعداد جدول learning_progress وسياسات RLS.');
+        console.error('English Hero cloud save:',error?.message||error);
+        return false;
+      }
+    };
+    uploadQueue=uploadQueue.catch(()=>false).then(write);
+    return uploadQueue;
+  }
+  window.saveCloudDisplayName=async function(name){
+    if(!client||!user)return;
+    try{
+      const {error}=await client.auth.updateUser({data:{full_name:name,display_name:name}});
+      if(error){status('حُفظ الاسم على هذا الجهاز، لكن تعذّر تحديث اسم الحساب السحابي.');console.error('English Hero display name:',error.message);return;}
+      setSignedInUI();
+      status('✅ تم حفظ الاسم وتحديثه في حسابك.');
+    }catch(error){status('حُفظ الاسم محليًا، لكن تعذّر تحديثه سحابيًا.');console.error('English Hero display name:',error?.message||error);}
+  };
+  window.queueCloudSave=function(){
+    if(!user||!ready||progressOwnerUserId!==user.id) return;
+    revision++;
+    clearTimeout(timer);
+    timer=setTimeout(uploadProgress,900);
+  };
+  function mergeProgress(remote){
+    const local=state||{};
+    const r=remote&&typeof remote==='object'&&!Array.isArray(remote)?remote:{};
+    const union=(a,b)=>[...new Set([...(Array.isArray(a)?a:[]),...(Array.isArray(b)?b:[])])];
+    const object=(v)=>v&&typeof v==='object'&&!Array.isArray(v)?v:{};
+    const chatRows=[...(Array.isArray(r.chatHistory)?r.chatHistory:[]),...(Array.isArray(local.chatHistory)?local.chatHistory:[])].filter(m=>m&&typeof m.text==='string'&&['me','bot'].includes(m.who));
+    const chatHistory=[...new Map(chatRows.map(m=>[JSON.stringify(m),m])).values()].slice(-60);
+    const daily={...object(r.daily),...object(local.daily)};
+    for(const day of new Set([...Object.keys(object(r.daily)),...Object.keys(object(local.daily))])) daily[day]={...object(object(r.daily)[day]),...object(object(local.daily)[day])};
+    state={...r,...local,
+      displayName:String(local.displayName||r.displayName||user?.user_metadata?.full_name||user?.user_metadata?.display_name||'').trim().slice(0,32),
+      xp:Math.max(0,Number(r.xp)||0,Number(local.xp)||0),
+      best:Math.min(100,Math.max(0,Number(r.best)||0,Number(local.best)||0)),
+      quizzes:Math.max(0,Number(r.quizzes)||0,Number(local.quizzes)||0),
+      streak:Math.max(0,Number(r.streak)||0,Number(local.streak)||0),
+      completed:union(r.completed,local.completed).filter(x=>Number.isInteger(x)&&x>=0&&x<lessons.length),
+      masteredLessons:typeof normalizeMasteredLessons==='function'?normalizeMasteredLessons(union(r.masteredLessons,local.masteredLessons)):union(r.masteredLessons,local.masteredLessons),
+      lessonStarted:union(r.lessonStarted,local.lessonStarted).filter(x=>Number.isInteger(x)&&x>=0&&x<lessons.length),
+      lessonTrained:union(r.lessonTrained,local.lessonTrained).filter(x=>Number.isInteger(x)&&x>=0&&x<lessons.length),
+      foundationSaved:union(r.foundationSaved,local.foundationSaved),
+      lessonPositions:{...object(r.lessonPositions),...object(local.lessonPositions)},
+      chatHistory,
+      saved:union(r.saved,local.saved),
+      review:mergeReviewProgress(r.review,local.review,r.misses,local.misses),
+      misses:reconcileReviewMisses(r.misses,local.misses,mergeReviewProgress(r.review,local.review,r.misses,local.misses)),
+      daily,
+      lastActive:[r.lastActive,local.lastActive].filter(v=>typeof v==='string').sort().pop()||'',
+      theme:local.theme||r.theme||'dark',rate:local.rate||r.rate||0.9
+    };
+    try { localStorage.setItem('english-hero-academy-3',JSON.stringify(state)); } catch {}
+  }
+  function replaceProgress(remote){
+    const r=remote&&typeof remote==='object'&&!Array.isArray(remote)?remote:{};
+    const base=typeof defaults==='function'?defaults():{};
+    state={...base,...r};
+    state.displayName=String(state.displayName||user?.user_metadata?.full_name||user?.user_metadata?.display_name||'').trim().slice(0,32);
+    state.xp=Math.max(0,Number(state.xp)||0);
+    state.best=Math.min(100,Math.max(0,Number(state.best)||0));
+    state.quizzes=Math.max(0,Number(state.quizzes)||0);
+    state.streak=Math.max(0,Number(state.streak)||0);
+    for(const key of ['completed','masteredLessons','lessonStarted','lessonTrained','saved','foundationSaved','chatHistory']) if(!Array.isArray(state[key])) state[key]=[];
+    state.masteredLessons=typeof normalizeMasteredLessons==='function'?normalizeMasteredLessons(state.masteredLessons):[...new Set(state.masteredLessons.filter(x=>Number.isInteger(x)&&x>=0&&x<lessons.length))];for(const key of ['lessonStarted','lessonTrained']) state[key]=[...new Set(state[key].filter(x=>Number.isInteger(x)&&x>=0&&x<lessons.length))];
+    for(const key of ['misses','review','daily','lessonPositions']) if(!state[key]||typeof state[key]!=='object'||Array.isArray(state[key])) state[key]={};
+    state.review=mergeReviewProgress({},state.review,{},state.misses);
+    state.misses=reconcileReviewMisses({},state.misses,state.review);
+    state.completed=[...new Set(state.completed.filter(x=>Number.isInteger(x)&&x>=0&&x<lessons.length))];
+    state.saved=[...new Set(state.saved)];
+    state.foundationSaved=[...new Set(state.foundationSaved.filter(x=>typeof x==='string'))];
+    state.theme=state.theme==='light'?'light':'dark';
+    state.rate=[0.7,0.9,1].includes(Number(state.rate))?Number(state.rate):0.9;
+    try { localStorage.setItem('english-hero-academy-3',JSON.stringify(state)); } catch {}
+  }
+  async function syncNow(){
+    if(!user||!client) return;
+    const requestedUserId=user.id;
+    // Serialize account changes without allowing an old account's request to block the new one.
+    if(syncPromise){
+      if(syncPromiseUserId===requestedUserId) return syncPromise;
+      try { await syncPromise; } catch {}
+      if(user && client) return syncNow();
+      return;
+    }
+    syncPromiseUserId=requestedUserId;
+    syncPromise=(async()=>{
+      const syncUserId=requestedUserId;
+      ready=false;setSignedInUI();status('جارٍ مزامنة تقدمك...');
+      try {
+        const {data,error}=await cloudRequest(client.from('learning_progress').select('progress').eq('user_id',syncUserId).maybeSingle());
+        if(error) throw error;
+        // If the learner signed out or switched accounts while the request was in flight, do not merge.
+        if(!user||user.id!==syncUserId) return;
+        const remoteProgress=data && data.progress && typeof data.progress==='object' && !Array.isArray(data.progress)?data.progress:null;
+        let localOwner='';
+        try { localOwner=localStorage.getItem('english-hero-cloud-owner')||''; } catch {}
+        if(localOwner && localOwner!==syncUserId){
+          // Preserve the outgoing snapshot only under the identity that actually owns it.
+          if(progressOwnerUserId===localOwner){
+            try { localStorage.setItem('english-hero-account-backup-'+localOwner,JSON.stringify(state)); } catch {}
+          }
+          replaceProgress(remoteProgress||{});
+          status(remoteProgress?'تم تحميل تقدم هذا الحساب فقط. حُفظت نسخة محلية من الحساب السابق.':'حساب جديد على هذا الجهاز؛ سيبدأ بتقدم مستقل، مع الاحتفاظ بنسخة الحساب السابق.');
+        } else if(!localOwner && remoteProgress){
+          // Preserve unclaimed legacy progress before loading an established cloud account.
+          try { localStorage.setItem('english-hero-unclaimed-local-backup',JSON.stringify(state)); } catch {}
+          replaceProgress(remoteProgress);
+        } else if(!localOwner && !remoteProgress){
+          // Never attach anonymous device progress to a newly signed-in learner.
+          // Shared school devices may contain another student's unclaimed local state.
+          const localState=state||{};
+          try {
+            const prefix='english-hero-unclaimed-local-backup-';
+            const backupKeys=Object.keys(localStorage).filter(key=>key.startsWith(prefix)).sort();
+            while(backupKeys.length>=3) localStorage.removeItem(backupKeys.shift());
+            localStorage.setItem(prefix+Date.now(),JSON.stringify(localState));
+          } catch {}
+          replaceProgress(typeof defaults==='function'?defaults():{});
+          status('بدأ الحساب بتقدم مستقل. لم ندمج أي تقدم مجهول من هذا الجهاز؛ احتُفظ بنسخة محلية منفصلة.');
+        } else if(remoteProgress){
+          mergeProgress(remoteProgress);
+        }
+        // The verified cloud read/merge now makes the active state belong to this account.
+        progressOwnerUserId=syncUserId;
+        try { localStorage.setItem('english-hero-cloud-owner',syncUserId); } catch {}
+        ready=true;setSignedInUI();
+        renderStats();renderCourses();renderHome();renderProfile();renderReview();
+        revision++;
+        const saved=await uploadProgress();
+        if(saved) status('✅ تمت مزامنة التقدم. جُمعت بيانات هذا الجهاز والحساب لتقليل فقدان التقدم.');
+      } catch(e) {
+        // A failed initial download must not unlock uploads: the local state may
+        // belong to another account, and uploading it could overwrite cloud data.
+        ready=false;setSignedInUI();
+        status(String(e?.message||'').includes('انتهت مهلة المزامنة') ? e.message : 'تعذرت مزامنة التقدم، وأوقفنا الرفع مؤقتًا لحماية بيانات حسابك. بقيت بياناتك محفوظة محليًا؛ حاول المزامنة بعد عودة الاتصال.');
+        console.error('English Hero cloud sync:',e?.message||e);
+      }
+    })();
+    try { return await syncPromise; }
+    finally {
+      if(syncPromiseUserId===requestedUserId){syncPromise=null;syncPromiseUserId=null;}
+      if(user && client && user.id!==requestedUserId) queueMicrotask(()=>syncNow());
+    }
+  }
+  async function init(){
+    if(!validConfig()){
+      status('تسجيل الدخول السحابي جاهز للتهيئة، لكنه غير مفعّل بعد. يلزم إعداد مشروع Supabase ومفتاحه العام في config.js.');
+      setSignedInUI();
+      resolveCloudInitialization(false);
+      return;
+    }
+    try {
+      if(!window.supabase?.createClient) throw new Error('لم تُحمّل مكتبة Supabase');
+      client=window.supabase.createClient(window.ENGLISH_HERO_CLOUD_CONFIG.supabaseUrl,window.ENGLISH_HERO_CLOUD_CONFIG.supabaseAnonKey,{
+        auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true}
+      });
+      // Register before getSession(): URL callback processing can emit PASSWORD_RECOVERY during initialization.
+      client.auth.onAuthStateChange(event=>{
+        if(event==='PASSWORD_RECOVERY') markPasswordRecovery();
+      });
+      const {data,error}=await client.auth.getSession();
+      if(error) throw error;
+      try { progressOwnerUserId=localStorage.getItem('english-hero-cloud-owner')||null; } catch { progressOwnerUserId=null; }
+      user=data.session?.user||null;
+      setSignedInUI();
+      client.auth.onAuthStateChange((event,session)=>{
+        const previousUser=user;
+        user=session?.user||null;
+        if(previousUser?.id!==user?.id) ready=false;
+        setSignedInUI();
+        if(event==='SIGNED_IN' && user) setTimeout(async()=>{
+          await syncNow();
+          window.dispatchEvent(new CustomEvent('englishhero:authready'));
+        },0);
+        if(event==='SIGNED_OUT'){
+          ready=false;
+          clearTimeout(timer);
+          // Save under the in-memory snapshot's owner, not the latest auth identity.
+          // Unclaimed device state remains unclaimed rather than being attributed to a student.
+          if(!clearingLocalAccountData){
+            try {
+              if(progressOwnerUserId) localStorage.setItem('english-hero-account-backup-'+progressOwnerUserId,JSON.stringify(state));
+              else localStorage.setItem('english-hero-unclaimed-local-backup-'+Date.now(),JSON.stringify(state));
+            } catch {}
+          }
+          try { localStorage.removeItem('english-hero-cloud-owner'); } catch {}
+          progressOwnerUserId=null;
+          if(typeof defaults==='function') replaceProgress(defaults());
+          renderStats();renderCourses();renderHome();renderProfile();renderReview();
+          status('تم تسجيل الخروج. حُفظت نسخة محلية للحساب السابق، وأُعيدت الشاشة إلى تقدم مستقل.');
+          user=null;
+          setSignedInUI();
+        }
+        if(event==='PASSWORD_RECOVERY') markPasswordRecovery();
+        window.dispatchEvent(new CustomEvent('englishhero:authstate',{detail:{event,user}}));
+      });
+      if(user) await syncNow();
+      else status('أنشئ حسابًا أو سجّل الدخول لمزامنة تقدمك بين الأجهزة.');
+      // Release the gateway only after the returning user's cloud progress has been restored.
+      resolveCloudInitialization(true);
+    } catch(e) {
+      status('تعذر تهيئة تسجيل الدخول. تحقق من إعدادات Supabase والاتصال بالإنترنت.');
+      console.error('English Hero cloud init:',e.message);
+      resolveCloudInitialization(false);
+    }
+  }
+  const friendlyAuthError = (error, mode) => {
+    const message = String(error?.message || '');
+    const lower = message.toLowerCase();
+    if (lower.includes('invalid login credentials')) return 'بيانات الدخول غير صحيحة، أو أن الحساب لم يُؤكَّد بعد. تأكد من البريد وكلمة المرور وأكّد البريد إذا وصلتك رسالة.';
+    if (lower.includes('email not confirmed')) return 'الحساب موجود لكن البريد غير مؤكّد. افتح رسالة Supabase لتأكيد البريد ثم حاول تسجيل الدخول.';
+    if (lower.includes('user already registered')) return 'هذا البريد مسجّل من قبل. استخدم «تسجيل الدخول» بدل إنشاء حساب جديد.';
+    if (lower.includes('password should be at least')) return 'كلمة المرور أقصر من الحد الذي يطلبه مزوّد الخدمة.';
+    if (lower.includes('email address') && lower.includes('invalid')) return 'صيغة البريد الإلكتروني غير صحيحة.';
+    if (lower.includes('signup is disabled') || lower.includes('signups not allowed')) return 'إنشاء الحسابات معطّل في إعدادات Supabase Auth.';
+    if (lower.includes('rate limit') || lower.includes('too many requests')) return 'محاولات كثيرة خلال وقت قصير. انتظر قليلًا ثم أعد المحاولة.';
+    if (lower.includes('failed to fetch') || lower.includes('network')) return 'تعذّر الاتصال بـ Supabase. تحقق من الإنترنت ومن عنوان المشروع.';
+    console.error('English Hero auth error:', {mode, message, status:error?.status, code:error?.code});
+    return (mode==='signup'?'تعذّر إنشاء الحساب: ':'تعذّر تسجيل الدخول: ') + (message || 'خطأ غير معروف') + ' — راجع إعدادات Authentication في Supabase.';
+  };
+  $cloud('cloudAuthForm')?.addEventListener('submit',async e=>{
+    e.preventDefault();
+    if(!client){status('تسجيل الدخول غير مهيأ: تعذّر الاتصال بمشروع Supabase.');return;}
+    const email=$cloud('cloudEmail').value.trim();
+    const password=$cloud('cloudPassword').value;
+    const button=$cloud('cloudSignIn');
+    button.disabled=true;
+    status('جارٍ التحقق من بيانات الدخول...');
+    try {
+      const {data,error}=await client.auth.signInWithPassword({email,password});
+      if(error){status(friendlyAuthError(error,'signin'));return;}
+      user=data.user||data.session?.user||null;
+      setSignedInUI();
+      status('تم تسجيل الدخول. جارٍ استرجاع تقدم الحساب...');
+      await syncNow();
+    } catch(error) {
+      status(friendlyAuthError(error,'signin'));
+    } finally {
+      button.disabled=!!user;
+    }
+  });
+  $cloud('cloudSignUp')?.addEventListener('click',async()=>{
+    if(!client){status('إنشاء الحساب غير مهيأ: تعذّر الاتصال بمشروع Supabase.');return;}
+    const email=$cloud('cloudEmail').value.trim();
+    const password=$cloud('cloudPassword').value;
+    if(!email||password.length<8){status('أدخل بريدًا صحيحًا وكلمة مرور من 8 أحرف على الأقل.');return;}
+    const button=$cloud('cloudSignUp');
+    button.disabled=true;
+    status('جارٍ إنشاء الحساب...');
+    try {
+      const {data,error}=await client.auth.signUp({email,password,options:{emailRedirectTo:location.origin+location.pathname,data:{full_name:(($cloud('displayNameInput')?.value||'').trim().replace(/\s+/g,' ').slice(0,32)),display_name:(($cloud('displayNameInput')?.value||'').trim().replace(/\s+/g,' ').slice(0,32))}}});
+      if(error){status(friendlyAuthError(error,'signup'));return;}
+      if(data.session){
+        user=data.user||data.session.user||null;
+        setSignedInUI();
+        status('تم إنشاء الحساب وتسجيل الدخول. جارٍ مزامنة التقدم...');
+        await syncNow();
+      } else {
+        status('تم إرسال طلب إنشاء الحساب. افتح رسالة التأكيد في بريدك، ثم ارجع وسجّل الدخول. إذا لم تصل الرسالة، افحص Spam وإعدادات SMTP/تأكيد البريد في Supabase.');
+      }
+    } catch(error) {
+      status(friendlyAuthError(error,'signup'));
+    } finally {
+      button.disabled=!!user;
+    }
+  });
+  $cloud('cloudGoogle')?.addEventListener('click',async()=>{
+    if(!client){status('تعذر تهيئة تسجيل الدخول.');return;}
+    status('جارٍ تحويلك إلى Google لتسجيل الدخول...');
+    try {
+      const {error}=await client.auth.signInWithOAuth({provider:'google',options:{redirectTo:location.href}});
+      if(error) status('تعذر تسجيل الدخول عبر Google. تحقق من تفعيل Google في Supabase Auth: '+error.message);
+    }catch(error){status('تعذر بدء تسجيل الدخول عبر Google: '+(error?.message||error));}
+  });
+  $cloud('cloudSignOut')?.addEventListener('click',async()=>{
+    if(!client)return;
+    const button=$cloud('cloudSignOut');
+    if(button) button.disabled=true;
+    status('جارٍ حفظ آخر تقدم قبل تسجيل الخروج...');
+    try {
+      if(user && ready && progressOwnerUserId===user.id){
+        clearTimeout(timer);
+        await uploadProgress();
+        try { localStorage.setItem('english-hero-account-backup-'+user.id,JSON.stringify(state)); } catch {}
+      }
+      const {error}=await client.auth.signOut();
+      if(error) throw error;
+    } catch(error) {
+      status('تعذر تسجيل الخروج. بقيت بياناتك محفوظة؛ تحقق من الاتصال ثم حاول مرة أخرى.');
+      console.error('English Hero sign out:',error?.message||error);
+    } finally {
+      setSignedInUI();
+    }
+  });
+  $cloud('cloudSyncNow')?.addEventListener('click',syncNow);
+  $cloud('cloudClearLocalData')?.addEventListener('click',async()=>{
+    if(!client||!user||!ready||progressOwnerUserId!==user.id)return;
+    if(!window.confirm('سيتم تسجيل خروجك وحذف بيانات هذا الحساب المحفوظة محليًا على هذا المتصفح فقط، بما فيها تقدم التعلم والنسخ الاحتياطية وبيانات Plus والمهام والمواقف. أي تغييرات لم تكتمل مزامنتها بعد ستُحذف ولن تُرفع قبل المسح. لن تُحذف بيانات السحابة أو الملفات التي صدّرتها أو بيانات الحسابات الأخرى. ستبقى النسخ المجهولة التي لا يمكن نسبتها إلى حساب محفوظة. هل تريد المتابعة؟'))return;
+    const button=$cloud('cloudClearLocalData');
+    if(button)button.disabled=true;
+    status('جارٍ إنهاء الجلسة وحذف النسخ المحلية لهذا الحساب...');
+    try{
+      const result=await window.EnglishHeroCloud.clearLocalAccountData();
+      status(result?.partial?'تم تسجيل الخروج، لكن تعذر حذف بعض البيانات المحلية. لا تسلّم الجهاز لمستخدم آخر قبل مسح بيانات الموقع من إعدادات المتصفح.':'تم حذف البيانات المحلية لهذا الحساب وتسجيل الخروج. بيانات السحابة لم تتغير.');
+    }catch(error){
+      status('تعذر إكمال المسح. لم نحذف بيانات الحساب المحلية؛ تحقق من الاتصال ثم حاول مجددًا.');
+      console.error('English Hero local account cleanup:',error?.message||error);
+    }finally{setSignedInUI();}
+  });
+  $cloud('cloudRestoreBackup')?.addEventListener('click',async()=>{
+    if(!client || !user || !ready) return;
+    const syncUserId=user.id;
+    const backupKey='english-hero-account-backup-'+syncUserId;
+    let backup;
+    try {
+      const raw=localStorage.getItem(backupKey);
+      if(!raw) throw new Error('لا توجد نسخة احتياطية لهذا الحساب على هذا الجهاز.');
+      backup=JSON.parse(raw);
+      if(!backup || typeof backup!=='object' || Array.isArray(backup)) throw new Error('ملف النسخة الاحتياطية غير صالح.');
+    } catch(error) {
+      const message=error?.message||'تعذرت قراءة النسخة الاحتياطية.';
+      const note=$cloud('cloudBackupStatus');
+      if(note) note.textContent=message;
+      return;
+    }
+    if(!window.confirm('سيتم دمج نسخة هذا الحساب المحفوظة على الجهاز مع تقدمه الحالي، مع الاحتفاظ بالتقدم الأحدث قدر الإمكان. هل تريد المتابعة؟')) return;
+    const note=$cloud('cloudBackupStatus');
+    if(note) note.textContent='جارٍ دمج النسخة الاحتياطية...';
+    const button=$cloud('cloudRestoreBackup');
+    if(button) button.disabled=true;
+    try {
+      backup.completed=Array.isArray(backup.completed)?backup.completed.filter(x=>Number.isInteger(x)&&x>=0):[];
+      backup.foundationSaved=Array.isArray(backup.foundationSaved)?backup.foundationSaved.filter(x=>typeof x==='string'):[];
+      backup.saved=Array.isArray(backup.saved)?backup.saved.filter(x=>typeof x==='string'):[];
+      backup.chatHistory=Array.isArray(backup.chatHistory)?backup.chatHistory.filter(x=>x&&typeof x.text==='string'&&['me','bot'].includes(x.who)).slice(-60):[];
+      for(const key of ['misses','review','daily','lessonPositions']) if(!backup[key]||typeof backup[key]!=='object'||Array.isArray(backup[key])) backup[key]={};
+      mergeProgress(backup);
+      if(!user || user.id!==syncUserId) throw new Error('تغيّر الحساب أثناء الاستعادة؛ لم يتم رفع النسخة.');
+      renderStats();renderCourses();renderHome();renderProfile();renderReview();
+      clearTimeout(timer);
+      revision++;
+      const saved=await uploadProgress();
+      if(note) note.textContent=saved?'تم دمج النسخة الاحتياطية لهذا الحساب. أبقينا النسخة محفوظة على الجهاز للرجوع إليها لاحقًا.':'تم دمج النسخة محليًا، لكن تعذّر رفعها الآن؛ ستبقى على الجهاز ويمكنك إعادة المزامنة لاحقًا.';
+    } catch(error) {
+      if(note) note.textContent=error?.message||'تعذرت استعادة النسخة الاحتياطية.';
+    } finally {
+      setSignedInUI();
+    }
+  });
+  // Retry pending local progress after the connection returns or the learner revisits the tab.
+  // Keep the local copy until the cloud confirms a successful write.
+  window.addEventListener('online',()=>{
+    if(user && client) syncNow();
+  });
+  document.addEventListener('visibilitychange',()=>{
+    if(document.visibilityState==='visible' && user && client) syncNow();
+    if(document.visibilityState==='hidden' && user && ready && revision>0){
+      clearTimeout(timer);
+      uploadProgress();
+    }
+  });
+
+  // Narrow public API used by the first-entry authentication gateway.
+  // The Supabase client remains configured with the public anon key only.
+  window.EnglishHeroCloud = Object.freeze({
+    getUser: () => user,
+    isConfigured: () => !!client,
+    isReady: () => !!ready,
+    async getProfile() {
+      if(!client || !user) return null;
+      const {data,error}=await client.from('student_profiles')
+        .select('username,display_name').eq('user_id',user.id).maybeSingle();
+      if(error) throw error;
+      return data || null;
+    },
+    async signInWithUsername(username,password) {
+      if(!client) throw new Error('خدمة الحسابات غير مهيأة.');
+      const {data,error}=await client.functions.invoke('student-username-login',{
+        body:{username,password}
+      });
+      if(error) throw error;
+      if(!data?.access_token || !data?.refresh_token) throw new Error('تعذّر إكمال تسجيل الدخول.');
+      const {data:sessionData,error:sessionError}=await client.auth.setSession({
+        access_token:data.access_token,refresh_token:data.refresh_token
+      });
+      if(sessionError) throw sessionError;
+      user=sessionData.user||sessionData.session?.user||user;
+      setSignedInUI();
+      await syncNow();
+      return user;
+    },
+    async claimProfile(username,displayName) {
+      if(!client || !user) throw new Error('سجّل الدخول أولًا.');
+      const {data,error}=await client.rpc('claim_student_username',{
+        p_username:username,p_display_name:displayName
+      });
+      if(error) throw error;
+      return data;
+    },
+    async setPassword(password) {
+      if(!client || !user) throw new Error('سجّل الدخول أولًا.');
+      const {error}=await client.auth.updateUser({password});
+      if(error) throw error;
+    },
+    async sendPasswordRecovery(email) {
+      if(!client) throw new Error('خدمة الحسابات غير مهيأة.');
+      const redirectTo=new URL(location.pathname,location.origin).toString();
+      const {error}=await client.auth.resetPasswordForEmail(email,{redirectTo});
+      if(error) throw error;
+    },
+    async updateRecoveredPassword(password) {
+      if(!client || !user) throw new Error('افتح رابط الاستعادة أولًا.');
+      const {error}=await client.auth.updateUser({password});
+      if(error) throw error;
+    },
+    async signInWithGoogle(nextPath=null) {
+      if(!client) throw new Error('خدمة الحسابات غير مهيأة.');
+      const callbackUrl=new URL(location.pathname,location.origin);
+      if(nextPath){
+        const target=new URL(nextPath,location.origin);
+        const basePath=new URL('./',location.href).pathname;
+        const allowed=['english-basics.html','english-tenses-guide.html','grammar-lesson.html','grammar-library.html','grammar-category.html'];
+        if(target.origin===location.origin && allowed.some(file=>target.pathname===basePath+file)){
+          callbackUrl.searchParams.set('next',target.pathname+target.search+target.hash);
+        }
+      }
+      const {error}=await client.auth.signInWithOAuth({
+        provider:'google',
+        options:{redirectTo:callbackUrl.toString()}
+      });
+      if(error) throw error;
+    },
+    async clearLocalAccountData() {
+      if(!client||!user||!ready||progressOwnerUserId!==user.id) throw new Error('لا يمكن حذف بيانات الحساب قبل اكتمال المزامنة والتحقق من مالك التقدم.');
+      const targetUserId=user.id;
+      let storedOwner='';
+      try{storedOwner=localStorage.getItem('english-hero-cloud-owner')||'';}catch{}
+      if(storedOwner&&storedOwner!==targetUserId)throw new Error('تعذر التحقق من مالك التقدم المحلي؛ لم نغيّر أي بيانات.');
+      const ownsActiveProgress=progressOwnerUserId===targetUserId&&(!storedOwner||storedOwner===targetUserId);
+      clearingLocalAccountData=true;
+      ready=false;
+      clearTimeout(timer);
+      revision++;
+      setSignedInUI();
+      try{
+        const {error}=await client.auth.signOut({scope:'local'});
+        if(error)throw error;
+        // Supabase emits SIGNED_OUT; keep this fallback for clients/mocks that do not.
+        if(user?.id===targetUserId){
+          user=null;
+          try{localStorage.removeItem('english-hero-cloud-owner');}catch{}
+          progressOwnerUserId=null;
+          if(typeof defaults==='function')replaceProgress(defaults());
+          window.dispatchEvent(new CustomEvent('englishhero:authstate',{detail:{event:'SIGNED_OUT',user:null}}));
+        }
+        const failedKeys=[];
+        const removeAndVerify=key=>{
+          try{localStorage.removeItem(key);if(localStorage.getItem(key)!==null)failedKeys.push(key);}
+          catch{failedKeys.push(key);}
+        };
+        if(ownsActiveProgress)removeAndVerify('english-hero-academy-3');
+        for(const key of [
+          'english-hero-account-backup-'+targetUserId,
+          'ehPlusV2:'+targetUserId,
+          'englishHeroStudentTasksV1:'+targetUserId,
+          'eh-scenarios-done:'+targetUserId
+        ])removeAndVerify(key);
+        try{if(localStorage.getItem('english-hero-cloud-owner')===targetUserId)removeAndVerify('english-hero-cloud-owner');}catch{failedKeys.push('english-hero-cloud-owner');}
+        renderStats();renderCourses();renderHome();renderProfile();renderReview();
+        return {partial:failedKeys.length>0};
+      }catch(error){
+        // If sign-out failed without changing identity, restore the usable signed-in state.
+        if(user?.id===targetUserId&&progressOwnerUserId===targetUserId)ready=true;
+        throw error;
+      }finally{
+        clearingLocalAccountData=false;
+        setSignedInUI();
+      }
+    },
+    async signOut() {
+      if(!client) return;
+      const {error}=await client.auth.signOut();
+      if(error) throw error;
+    }
+  });
+  init();
+})();
